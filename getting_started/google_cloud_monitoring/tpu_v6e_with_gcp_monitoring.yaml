@@ -1,0 +1,111 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: v6e-maxtext
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: v6e-maxtext-workload
+  type: ClusterIP
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: v6e-maxtext-workload
+  namespace: default
+spec:
+  completionMode: Indexed  # Required for TPU workloads
+  backoffLimit: 0
+  completions: 4  # number of nodes
+  parallelism: 4
+  template:
+    metadata:
+      labels:
+        job-name: v6e-maxtext-workload
+    spec:
+      restartPolicy: Never
+      subdomain: v6e-maxtext-workload
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+      dnsPolicy: ClusterFirstWithHostNet  # Ensure proper name resolution for TPU pods
+      containers:
+      - name: training-workload  
+        image: <replace with path to your maxtext docker image>
+        ports:
+        - containerPort: 8471  # Default TPU communication port
+        - containerPort: 9431  # TPU metrics port for monitoring
+        command:
+        - /bin/bash
+        - -c
+        - |
+          env
+          echo "run name: maxtext-llama-2-tpu-${TIMESTAMP}"
+          echo "gcs bucket path: ${GCS_BUCKET_PATH}"
+          echo "Job starting!";
+          trap 'echo "Exiting..."; touch /usr/share/maxtext/workload_terminated' EXIT
+          python3 /deps/MaxText/train.py /deps/MaxText/configs/base.yml run_name=maxtext-llama2-tpu-${TIMESTAMP} model_name=llama2-7b attention=dot_product remat_policy=save_qkv_proj use_iota_embed=true max_target_length=1024 tokenizer_path=/deps/assets/tokenizer.llama2 dataset_path=${DATASET_PATH} per_device_batch_size=1 checkpoint_period=5 steps=100 base_output_directory=${GCS_BUCKET_PATH} enable_gcp_workload_monitoring=True
+          echo "Job completed!";
+
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/secrets/tpu-prod-env-one-vm-key.json"  # Path to the mounted service account key
+        volumeMounts:
+        - name: gcs-key
+          mountPath: "/secrets"
+          readOnly: true
+        - name: "workload-shared-volume"
+          mountPath: "/usr/share/maxtext"
+        resources:
+          requests:
+            google.com/tpu: "4"  # Adjust based on TPU topology
+          limits:
+            google.com/tpu: "4"
+      - name: workload-observability
+        image: us-west2-docker.pkg.dev/gce-ai-infra/workload-observability/model-workload-observability:heartbeat
+        command:
+        - /bin/bash
+        - -c
+        - |
+          env
+          echo "GCS_BUCKET_PATH: ${GCS_BUCKET_PATH}, timestamp: ${TIMESTAMP}"
+          echo "MaxText logs are sent to ${GCS_BUCKET_PATH}/maxtext-llama2-tpu-${TIMESTAMP}"
+          python -u /app/main.py --replica_id 0 --gpu_index 0 &
+          while [ ! -e "/usr/share/maxtext/workload_terminated" ];
+          do
+          sleep 10;
+          done
+          pkill -f 'python -u /app/main.py --replica_id' || true
+          sleep 10
+        env:
+        - name: JOB_TIMESTAMP
+          value: "{{ $TIMESTAMP }}"
+        - name: JOB_NAME
+          value: "maxtext-llama2-tpu-${TIMESTAMP}"
+        - name: TFEVENTS_PATH
+          value: "${GCS_BUCKET_PATH}/maxtext-llama2-tpu-${TIMESTAMP}/tensorboard/maxtext-llama2-tpu-${TIMESTAMP}"
+        - name: TFEVENTS_METRIC_TAG
+          value: "perf/step_time_seconds"
+        - name: REPORT_HEARTBEAT
+          value: "false"
+        - name: GLOBAL_RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        volumeMounts:
+        - name: gcs-key
+          mountPath: "/secrets"
+          readOnly: true
+        - name: "workload-shared-volume"
+          mountPath: "/usr/share/maxtext"
+      volumes:
+      - name: gcs-key
+        secret:
+          secretName: gcs-key
+      - name: workload-shared-volume
+        emptyDir: {}
