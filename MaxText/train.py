@@ -25,6 +25,7 @@ import os
 import sys
 import functools
 import time
+import threading
 
 from typing import Sequence, Optional
 from absl import app
@@ -51,6 +52,8 @@ from vertex_tensorboard import VertexTensorboardManager
 
 from input_pipeline.input_pipeline_interface import create_data_iterator
 from layers import models
+
+from monitoring.gcp_workload_monitor import report_heartbeat_thread
 
 import jax.numpy as jnp
 from jax import random
@@ -751,7 +754,7 @@ def setup_train_loop(config):
   )
 
 
-def train_loop(config, state=None):
+def train_loop(config, state=None, stop_event=None):
   """Main Training loop.
   Args:
     config:
@@ -851,6 +854,11 @@ def train_loop(config, state=None):
   example_batch = None
   last_step_completion = datetime.datetime.now()
   prof = profiler.Profiler(config)
+  if config.enable_gcp_workload_monitoring and stop_event:
+    max_logging.log("Starting background thread for reporting heartbeat")
+    t = threading.Thread(target=report_heartbeat_thread, args=(stop_event,))
+    t.daemon = True
+    t.start()
   for step in np.arange(start_step, config.steps):
     max_utils.print_mem_stats(f"step {step}")
     if step == first_profiling_step:
@@ -986,8 +994,11 @@ def main(argv: Sequence[str]) -> None:
       )
   )
   diagnostic_config = diagnostic_configuration.DiagnosticConfig(debug_config)
+  stop_event = threading.Event() if config.enable_gcp_workload_monitoring else None
   with diagnostic.diagnose(diagnostic_config):
-    train_loop(config)
+    train_loop(config, state=None, stop_event=stop_event)
+  if stop_event:
+    stop_event.set()
 
 
 if __name__ == "__main__":
